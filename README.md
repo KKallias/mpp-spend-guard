@@ -1,5 +1,13 @@
 # mpp-spend-guard
 
+![Status](https://img.shields.io/badge/status-MVP%20%2F%20testnet%20verified-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Node](https://img.shields.io/badge/node-%3E%3D20-blue)
+
+> **Status: MVP / testnet only.** Verified end-to-end against a live
+> MPP-protected endpoint on Tempo's Moderato testnet. Holds no real funds
+> and is not ready for production use.
+
 Pre-payment spend-limit check + audit log for agents transacting over the
 [Machine Payments Protocol (MPP)](https://mpp.dev) — Stripe & Tempo's open
 standard for billing AI agents over HTTP (launched March 2026).
@@ -135,3 +143,7 @@ similar position to where x402 was when the spend-guard idea started. Its
 "session" primitive (pre-authorized spending limit, streamed micropayments)
 maps directly onto what this guard checks, arguably more naturally than
 x402's per-request-only model.
+
+## License
+
+[MIT](LICENSE)

@@ -6,6 +6,10 @@
   "scripts": {
     "test": "node --test"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KKallias/mpp-spend-guard.git"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=20"
