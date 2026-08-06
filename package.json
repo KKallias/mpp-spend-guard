@@ -1,0 +1,17 @@
+{
+  "name": "mpp-spend-guard",
+  "version": "0.1.0",
+  "description": "Pre-payment spend-limit guard and audit log for Machine Payments Protocol (MPP) agent sessions.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "mppx": "^0.8.15",
+    "viem": "^2.55.11"
+  }
+}
