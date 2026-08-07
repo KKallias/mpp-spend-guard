@@ -24,6 +24,22 @@ SpendGuard checks it against configured limits and logs the decision —
 - **Session cap** — reject once cumulative session spend would exceed a max
 - **Rate limit** — reject if too many requests happen in a rolling window
 - **Recipient allowlist** (optional) — reject payments to unrecognized recipients
+- **Price-ceiling enforcement at signing time** — the approved amount is re-checked
+  against the live challenge before the credential is signed (see below)
+
+### Why the price ceiling matters
+
+The guard evaluates a challenge observed at one moment, but the actual payment
+issues a *fresh* request — and the server's new challenge doesn't have to quote
+the same price. MPP services are free to price dynamically (the mpp.dev
+directory lists services ranging $0.05–$4 per call), so a server could quote
+cheap when probed and expensive when actually paid. The audit log would say
+`allowed: 100000` while the wallet paid far more.
+
+`src/mppClient.js` closes this by enforcing the guard-approved amount as a hard
+ceiling inside mppx's `onChallenge` hook, which runs **before** the credential is
+signed. If the live challenge asks for more than was approved, it throws and no
+payment is ever signed or sent.
 
 Every decision — allowed or blocked — is appended to `audit.log` as one JSON
 line, so it's grep-able and can later be reconciled against MPP's own
@@ -33,7 +49,7 @@ balance/ledger view.
 
 - [x] Core decision engine (`src/spendGuard.js`)
 - [x] Audit logging (`src/auditLog.js`)
-- [x] Unit tests, 6/6 passing, zero network dependency (`npm test`)
+- [x] Unit tests, 11/11 passing, no external network needed — loopback only (`npm test`)
 - [x] Wired to the real MPP client (`mppx`) against Tempo's Moderato testnet (`src/mppClient.js`)
 - [x] End-to-end run with a real approved payment and a real blocked request (see below)
 

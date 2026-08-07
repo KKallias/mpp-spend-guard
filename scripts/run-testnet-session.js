@@ -41,16 +41,20 @@ async function main() {
   console.log('Live challenge from', ENDPOINT, '->', challenge);
 
   // --- Scenario 1: ALLOWED, real payment goes through ---
+  // Caps come from the SPEND_GUARD_* env vars (see .env.example), falling back
+  // to values that sit above the ping endpoint's $0.10 price.
   const allowGuard = new SpendGuard({
-    perRequestCapMinor: 200_000, // $0.20 — above the $0.10 ping price
-    sessionCapMinor: 1_000_000,
+    perRequestCapMinor: Number(process.env.SPEND_GUARD_PER_REQUEST_CAP_MINOR ?? 200_000),
+    sessionCapMinor: Number(process.env.SPEND_GUARD_SESSION_CAP_MINOR ?? 1_000_000),
+    maxRequestsPerWindow: Number(process.env.SPEND_GUARD_MAX_REQUESTS_PER_WINDOW ?? 30),
+    windowMs: Number(process.env.SPEND_GUARD_WINDOW_MS ?? 60_000),
   });
   const allowedResult = await guardedPay(mppClient, challenge, allowGuard, auditLog);
   console.log('\n[ALLOW scenario]');
   console.log('paid:', allowedResult.paid, 'reason:', allowedResult.decision.reason);
   if (allowedResult.paid) {
-    console.log('receipt header:', allowedResult.receipt.receiptHeader);
     console.log('response status:', allowedResult.receipt.status);
+    console.log('decoded receipt:', allowedResult.receipt.receipt);
   }
 
   // --- Scenario 2: BLOCKED, guard rejects before any network payment call ---
