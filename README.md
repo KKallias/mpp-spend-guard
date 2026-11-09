@@ -26,6 +26,10 @@ SpendGuard checks it against configured limits and logs the decision —
 - **Recipient allowlist** (optional) — reject payments to unrecognized recipients
 - **Price-ceiling enforcement at signing time** — the approved amount is re-checked
   against the live challenge before the credential is signed (see below)
+- **Fail closed on malformed input** — amounts must be non-negative integers in
+  minor units; anything else (NaN, Infinity, fractions, strings, bigint) is denied
+- **Fetch timeout + outcome_unknown reconciliation** — a payment that hangs after
+  signing is counted as spent and blocks retries until a human reconciles it
 
 ### Why the price ceiling matters
 
@@ -49,9 +53,45 @@ balance/ledger view.
 
 - [x] Core decision engine (`src/spendGuard.js`)
 - [x] Audit logging (`src/auditLog.js`)
-- [x] Unit tests, 11/11 passing, no external network needed — loopback only (`npm test`)
+- [x] Unit tests, 20/20 passing, no external network needed — loopback only (`npm test`)
 - [x] Wired to the real MPP client (`mppx`) against Tempo's Moderato testnet (`src/mppClient.js`)
 - [x] End-to-end run with a real approved payment and a real blocked request (see below)
+- [x] Failure states: malformed amounts, missing ceiling, timeouts, outcome_unknown (see below)
+
+## Failure states (tested)
+
+| Failure | What happens | Audit `reason` |
+|---|---|---|
+| NaN / Infinity / 1.5 / `'100'` / `null` / `undefined` / negative amount | Denied before any network call; `recordSpend()` throws so the session total can't be poisoned | `invalid_amount` |
+| bigint amount (e.g. `100000n`) | Denied (safe). BigInt-native math is a **TODO before mainnet** | `invalid_amount` |
+| Missing / NaN / non-integer ceiling at signing | `onChallenge` throws `no valid approved amount — refusing to sign`; no credential is created | `payment_failed` |
+| Endpoint hangs before a challenge is signed | `pay()` aborts after `timeoutMs` (default 30 s) with `TIMEOUT_BEFORE_SIGNING`; no spend recorded | `timeout_before_signing` |
+| Endpoint hangs / errors *after* the credential was signed | `OUTCOME_UNKNOWN`: amount counted as spent and held pending; further payments to that resource are denied until `guard.reconcile(paymentId, { settled })` | `outcome_unknown`, then `pending_reconciliation` |
+
+`guardedPay()` never throws for payment failures — it returns
+`{ paid: false, paymentId, decision, error }` and writes a second audit line
+with the outcome. For `outcome_unknown`, the line carries the `paymentId` and a
+note that it needs human reconciliation against the on-chain balance:
+
+```js
+// after checking the wallet balance / tx history on-chain:
+guard.reconcile(paymentId, { settled: false }); // releases the amount
+guard.reconcile(paymentId, { settled: true });  // keeps it counted
+```
+
+## Reproduce in 5 minutes
+
+```bash
+git clone https://github.com/KKallias/mpp-spend-guard.git
+cd mpp-spend-guard
+npm ci
+npm test                      # 20/20, loopback only, no keys needed
+cp .env.example .env          # fill in a THROWAWAY, faucet-funded testnet key
+node --env-file=.env scripts/run-testnet-session.js
+cat audit.log                 # one allowed + paid, one blocked
+```
+
+Never commit `.env` (it's in `.gitignore`) and never use a key that holds real funds.
 
 ## Quickstart (logic only, no network needed)
 
@@ -151,6 +191,15 @@ To reproduce: copy `.env.example` to `.env`, fill in a funded
 ```bash
 node --env-file=.env scripts/run-testnet-session.js
 ```
+
+## Open items
+
+- `outcome_unknown` is verified **offline only** (loopback server + fake client);
+  not yet exercised against a real hanging Moderato endpoint.
+- Amounts are JS numbers (safe up to 2^53 − 1 minor units); BigInt-native math
+  is a TODO before mainnet.
+- Pending reconciliation is in-memory per `SpendGuard` instance — it does not
+  survive a process restart; the audit log is the durable record.
 
 ## Why MPP and not another protocol
 

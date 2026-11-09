@@ -17,17 +17,22 @@ class AuditLog {
   /**
    * @param {object} entry
    * @param {object} entry.challenge   The MPP Challenge that was evaluated.
-   * @param {object} entry.decision    The result returned by SpendGuard.evaluate().
+   * @param {object} entry.decision    The result returned by SpendGuard.evaluate(), or a
+   *                                   payment-outcome record written by guardedPay.
+   * @param {string} [entry.paymentId] Payment id, for reconciliation.
+   * @param {string} [entry.note]      Free-text note (e.g. reconciliation instructions).
    */
-  record({ challenge, decision }) {
+  record({ challenge, decision, paymentId, note }) {
     const line = JSON.stringify({
       ts: new Date().toISOString(),
       resource: challenge && challenge.resource,
-      amountMinor: challenge && challenge.amountMinor,
+      amountMinor: challenge && safeAmount(challenge.amountMinor),
       recipient: challenge && challenge.recipient,
       allowed: decision.allowed,
       reason: decision.reason,
       sessionSpentMinor: decision.sessionSpentMinor,
+      ...(paymentId !== undefined ? { paymentId } : {}),
+      ...(note !== undefined ? { note } : {}),
     });
     fs.appendFileSync(this.filePath, line + '\n');
     return line;
@@ -42,6 +47,14 @@ class AuditLog {
       .filter(Boolean)
       .map((l) => JSON.parse(l));
   }
+}
+
+// JSON.stringify throws on bigint and silently turns NaN/Infinity into null;
+// keep malformed amounts visible in the log instead.
+function safeAmount(v) {
+  if (typeof v === 'bigint') return `${v}n`;
+  if (typeof v === 'number' && !Number.isFinite(v)) return String(v);
+  return v;
 }
 
 module.exports = { AuditLog };

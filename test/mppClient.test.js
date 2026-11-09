@@ -12,7 +12,12 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { generatePrivateKey } = require('viem/accounts');
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
 const { createMppClient, decodeReceipt } = require('../src/mppClient');
+const { SpendGuard, AuditLog, guardedPay } = require('../src');
 
 /**
  * Serves a 402 quoting `amount`, so we can assert what the client does with
@@ -103,4 +108,62 @@ test('decodes a Payment-Receipt header into the settlement reference', () => {
 test('decodeReceipt returns null for a missing or unreadable header', () => {
   assert.equal(decodeReceipt(null), null);
   assert.equal(decodeReceipt('not-valid-base64-json'), null);
+});
+
+// --- Day 4: fail closed + timeout ---------------------------------------------
+
+/** Accepts connections and never responds. */
+function startHangingServer() {
+  const sockets = new Set();
+  const server = http.createServer(() => { /* never respond */ });
+  server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      const close = () => { for (const s of sockets) s.destroy(); server.close(); };
+      resolve({ close, url: `http://127.0.0.1:${port}/paid` });
+    });
+  });
+}
+
+test('hanging endpoint → TIMEOUT_BEFORE_SIGNING, nothing recorded as spent', async () => {
+  const { close, url } = await startHangingServer();
+  try {
+    const client = createMppClient({ privateKey: generatePrivateKey() });
+    await assert.rejects(
+      () => client.pay({ resource: url, amountMinor: 100_000 }, { timeoutMs: 300 }),
+      (err) => err.code === 'TIMEOUT_BEFORE_SIGNING',
+    );
+
+    const guard = new SpendGuard({ perRequestCapMinor: 200_000, sessionCapMinor: 1_000_000 });
+    const auditLog = new AuditLog(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mpp-guard-')), 'audit.log'));
+    const result = await guardedPay(client, { resource: url, amountMinor: 100_000 }, guard, auditLog, { timeoutMs: 300 });
+    assert.equal(result.paid, false);
+    assert.equal(result.error.code, 'TIMEOUT_BEFORE_SIGNING');
+    assert.deepEqual(auditLog.readAll().map((e) => e.reason), ['ok', 'timeout_before_signing']);
+    assert.equal(guard.sessionSpentMinor, 0);
+    assert.equal(guard.hasPending(), false);
+  } finally {
+    close();
+  }
+});
+
+test('missing or NaN ceiling → onChallenge refuses to sign', async () => {
+  const { server, url } = await startChallengeServer(100_000);
+  try {
+    const client = createMppClient({ privateKey: generatePrivateKey() });
+    for (const amountMinor of [undefined, NaN, 1.5, -1, '100000']) {
+      await assert.rejects(
+        () => client.pay({ resource: url, amountMinor }),
+        (err) => {
+          assert.match(err.message, /no valid approved amount — refusing to sign/);
+          assert.equal(err.code, 'PAYMENT_FAILED');
+          return true;
+        },
+        `ceiling ${String(amountMinor)} should be refused`,
+      );
+    }
+  } finally {
+    server.close();
+  }
 });

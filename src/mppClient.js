@@ -24,8 +24,8 @@ const { Mppx, tempo } = require('mppx/client');
  *
  * So pay() enforces the approved amount as a hard ceiling inside mppx's
  * `onChallenge` hook, which runs *before* the credential is signed. If the
- * live challenge asks for more than the guard approved, we throw and no
- * payment is ever signed or sent.
+ * live challenge asks for more than the guard approved — or no valid approved
+ * amount was passed at all — we throw and no payment is ever signed or sent.
  *
  * @param {object} [opts]
  * @param {string} [opts.privateKey]  Defaults to AGENT_WALLET_PRIVATE_KEY env var.
@@ -38,10 +38,10 @@ function createMppClient(opts = {}) {
 
   const account = privateKeyToAccount(privateKey);
 
-  // Carries the per-call approved ceiling into the onChallenge hook. Uses
-  // AsyncLocalStorage rather than a plain closure variable so that concurrent
-  // pay() calls can't read each other's ceiling.
-  const ceilingStore = new AsyncLocalStorage();
+  // Carries per-call state into the onChallenge hook: the approved ceiling and
+  // whether we have let mppx sign a credential. Uses AsyncLocalStorage rather
+  // than a closure variable so concurrent pay() calls can't read each other's.
+  const callStore = new AsyncLocalStorage();
 
   // polyfill: false — keep globalThis.fetch untouched so callers can still
   // make plain, unpaid probe requests; only mppx.fetch() is payment-aware.
@@ -49,20 +49,28 @@ function createMppClient(opts = {}) {
     methods: [tempo({ account })],
     polyfill: false,
     onChallenge: async (challenge) => {
-      const ceiling = ceilingStore.getStore();
-      if (typeof ceiling === 'number') {
-        const quoted = Number(challenge.request && challenge.request.amount);
-        if (!Number.isFinite(quoted)) {
-          throw new Error(
-            `MPP challenge has no readable amount (got ${JSON.stringify(challenge.request && challenge.request.amount)}) — refusing to sign`,
-          );
-        }
-        if (quoted > ceiling) {
-          throw new Error(
-            `MPP challenge asks for ${quoted} but the guard only approved ${ceiling} — refusing to sign`,
-          );
-        }
+      const ctx = callStore.getStore();
+      const ceiling = ctx && ctx.ceiling;
+      // Fail closed: never sign without a valid approved amount.
+      if (!Number.isInteger(ceiling) || ceiling < 0) {
+        throw new Error(
+          `no valid approved amount — refusing to sign (got ${JSON.stringify(ceiling === undefined ? 'undefined' : String(ceiling))})`,
+        );
       }
+      const quoted = Number(challenge.request && challenge.request.amount);
+      if (!Number.isFinite(quoted)) {
+        throw new Error(
+          `MPP challenge has no readable amount (got ${JSON.stringify(challenge.request && challenge.request.amount)}) — refusing to sign`,
+        );
+      }
+      if (quoted > ceiling) {
+        throw new Error(
+          `MPP challenge asks for ${quoted} but the guard only approved ${ceiling} — refusing to sign`,
+        );
+      }
+      // From here on mppx signs and sends a credential: any later failure means
+      // the payment outcome is unknown.
+      ctx.signed = true;
       // Returning undefined lets mppx sign the credential as normal.
       return undefined;
     },
@@ -74,21 +82,47 @@ function createMppClient(opts = {}) {
     /**
      * @param {object} challenge
      * @param {string} challenge.resource     URL of the MPP-protected resource to pay for.
-     * @param {number} [challenge.amountMinor] Amount the guard approved; enforced as a
-     *   hard ceiling on what the live challenge is allowed to charge.
+     * @param {number} challenge.amountMinor  Amount the guard approved; enforced as a
+     *   hard ceiling on what the live challenge is allowed to charge. Required —
+     *   without it the client refuses to sign.
+     * @param {object} [opts]
+     * @param {number} [opts.timeoutMs=30000]  Abort the whole paid fetch after this long.
      * @returns {Promise<object>} Receipt-like object (status, receipt header + decoded receipt, body).
+     * @throws {Error} with `.code`:
+     *   - 'TIMEOUT_BEFORE_SIGNING' — timed out before any credential was signed; nothing paid.
+     *   - 'OUTCOME_UNKNOWN'        — failed after signing; the payment may have settled.
+     *   - 'PAYMENT_FAILED'         — any other failure (refused to sign, still 402, ...).
      */
-    async pay(challenge) {
-      const ceiling =
-        typeof challenge.amountMinor === 'number' ? challenge.amountMinor : undefined;
+    async pay(challenge, { timeoutMs = 30_000 } = {}) {
+      const ctx = { ceiling: challenge.amountMinor, signed: false };
+      const signal = AbortSignal.timeout(timeoutMs);
 
-      const response = await ceilingStore.run(ceiling, () => mppx.fetch(challenge.resource));
+      let response;
+      try {
+        response = await callStore.run(ctx, () => mppx.fetch(challenge.resource, { signal }));
+      } catch (err) {
+        if (ctx.signed) {
+          throw withCode(
+            `MPP payment outcome unknown — credential may have been sent: ${err.message}`,
+            'OUTCOME_UNKNOWN',
+            err,
+          );
+        }
+        if (isAbortError(err)) {
+          throw withCode(
+            `MPP request timed out after ${timeoutMs}ms before signing — nothing was paid`,
+            'TIMEOUT_BEFORE_SIGNING',
+            err,
+          );
+        }
+        throw withCode(`MPP payment failed: ${err.message}`, 'PAYMENT_FAILED', err);
+      }
 
       if (response.status === 402) {
         // Guard already approved this, but the live endpoint still rejected
         // the payment (e.g. expired challenge, insufficient balance).
         const body = await response.text();
-        throw new Error(`MPP payment failed: still 402 after retry — ${body}`);
+        throw withCode(`MPP payment failed: still 402 after retry — ${body}`, 'PAYMENT_FAILED');
       }
 
       const receiptHeader = response.headers.get('payment-receipt');
@@ -102,6 +136,17 @@ function createMppClient(opts = {}) {
       };
     },
   };
+}
+
+function isAbortError(err) {
+  return !!err && (err.name === 'AbortError' || err.name === 'TimeoutError' ||
+    (err.cause && (err.cause.name === 'AbortError' || err.cause.name === 'TimeoutError')));
+}
+
+function withCode(message, code, cause) {
+  const err = new Error(message, cause ? { cause } : undefined);
+  err.code = code;
+  return err;
 }
 
 /**

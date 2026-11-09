@@ -34,6 +34,9 @@ class SpendGuard {
 
     this._sessionSpentMinor = 0;
     this._requestTimestamps = [];
+    // Payments whose outcome is unknown (credential may have been sent, but no
+    // response came back). Keyed by payment id -> { amountMinor, resource }.
+    this._pending = new Map();
   }
 
   /**
@@ -48,8 +51,19 @@ class SpendGuard {
     const now = Date.now();
     const { amountMinor, recipient, resource } = challenge;
 
-    if (typeof amountMinor !== 'number' || amountMinor < 0) {
+    // Strict: only non-negative safe integers in minor units. Rejects NaN,
+    // ±Infinity, fractions, numeric strings, null/undefined and bigint — any of
+    // which would otherwise slip past `<`/`>` comparisons (NaN compares false).
+    if (!Number.isInteger(amountMinor) || amountMinor < 0) {
       return this._deny('invalid_amount', challenge);
+    }
+
+    // A payment to this resource is still awaiting reconciliation — retrying
+    // could pay twice. Entries without a known resource block everything.
+    for (const entry of this._pending.values()) {
+      if (entry.resource === undefined || entry.resource === resource) {
+        return this._deny('pending_reconciliation', challenge);
+      }
     }
 
     if (amountMinor > this.config.perRequestCapMinor) {
@@ -84,9 +98,52 @@ class SpendGuard {
    * separate avoids counting a charge that was evaluated but never actually sent.
    */
   recordSpend(amountMinor) {
+    assertValidAmount(amountMinor, 'recordSpend');
     this._sessionSpentMinor += amountMinor;
     this._requestTimestamps.push(Date.now());
     return this._sessionSpentMinor;
+  }
+
+  /**
+   * Call when a payment's outcome is unknown (e.g. timed out after the
+   * credential was signed). The amount is counted as spent — fail closed — and
+   * further payments to the same resource are blocked until reconcile().
+   * @param {string} id            Payment id (from guardedPay).
+   * @param {number} amountMinor   Amount that may have been paid.
+   * @param {string} [resource]    Resource it was paid for. If omitted, ALL
+   *                               resources are blocked until reconciled.
+   */
+  markOutcomeUnknown(id, amountMinor, resource) {
+    assertValidAmount(amountMinor, 'markOutcomeUnknown');
+    if (this._pending.has(id)) throw new Error(`markOutcomeUnknown: id ${id} is already pending`);
+    this._sessionSpentMinor += amountMinor;
+    this._requestTimestamps.push(Date.now());
+    this._pending.set(id, { amountMinor, resource });
+    return this._sessionSpentMinor;
+  }
+
+  /**
+   * Resolve a pending payment after checking the real (on-chain) outcome.
+   * @param {string} id
+   * @param {{settled: boolean}} outcome  settled=false releases the amount.
+   * @returns {boolean} false if no pending entry had that id.
+   */
+  reconcile(id, { settled } = {}) {
+    const entry = this._pending.get(id);
+    if (!entry) return false;
+    if (settled === false) this._sessionSpentMinor -= entry.amountMinor;
+    this._pending.delete(id);
+    return true;
+  }
+
+  /** Current session spend in minor units (includes pending outcome_unknown amounts). */
+  get sessionSpentMinor() {
+    return this._sessionSpentMinor;
+  }
+
+  /** @returns {boolean} true if any payment is awaiting reconciliation. */
+  hasPending() {
+    return this._pending.size > 0;
   }
 
   _deny(reason, challenge) {
@@ -96,6 +153,12 @@ class SpendGuard {
       sessionSpentMinor: this._sessionSpentMinor,
       resource: challenge && challenge.resource,
     };
+  }
+}
+
+function assertValidAmount(amount, where) {
+  if (!Number.isInteger(amount) || amount < 0) {
+    throw new Error(`${where}: amount must be a non-negative integer in minor units (got ${typeof amount === 'bigint' ? amount + 'n' : String(amount)})`);
   }
 }
 
