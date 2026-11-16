@@ -216,3 +216,84 @@ test('guardedPay: other payment errors record no spend and return payment_failed
   assert.equal(guard.hasPending(), false);
   assert.deepEqual(auditLog.readAll().map((e) => e.reason), ['ok', 'payment_failed']);
 });
+
+// --- Hardening: allowlist fail-closed + parallel calls -------------------------
+
+test('allowlist denies a challenge that names no recipient', () => {
+  const guard = new SpendGuard({ perRequestCapMinor: 100, sessionCapMinor: 1000, allowedRecipients: ['svc_search'] });
+  for (const recipient of [undefined, null, '', 42]) {
+    const result = guard.evaluate(mockChallenge({ recipient }));
+    assert.equal(result.allowed, false, `recipient ${String(recipient)} should be denied`);
+    assert.equal(result.reason, 'recipient_not_allowlisted');
+  }
+});
+
+test('allowlist matches addresses regardless of checksum casing', () => {
+  const guard = new SpendGuard({
+    perRequestCapMinor: 100,
+    sessionCapMinor: 1000,
+    allowedRecipients: ['0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266'],
+  });
+  const result = guard.evaluate(mockChallenge({ recipient: '0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266' }));
+  assert.equal(result.allowed, true);
+});
+
+/** A client whose pay() stays pending until release() is called. */
+function slowClient() {
+  let calls = 0;
+  let open;
+  const gate = new Promise((resolve) => { open = resolve; });
+  return {
+    get calls() { return calls; },
+    release: () => open(),
+    async pay() { calls += 1; await gate; return { receiptId: `rcpt_${calls}` }; },
+  };
+}
+
+test('parallel guardedPay calls cannot overspend the session cap', async () => {
+  // Budget fits two payments of 10. Five are fired at once.
+  const guard = new SpendGuard({ perRequestCapMinor: 100, sessionCapMinor: 25 });
+  const client = slowClient();
+  const auditLog = tmpAuditLog();
+
+  const inFlight = Array.from({ length: 5 }, () =>
+    guardedPay(client, mockChallenge({ amountMinor: 10 }), guard, auditLog));
+  client.release();
+  const results = await Promise.all(inFlight);
+
+  assert.equal(results.filter((r) => r.paid).length, 2);
+  assert.equal(client.calls, 2);
+  assert.equal(guard.sessionSpentMinor, 20);
+  assert.deepEqual(
+    results.filter((r) => !r.paid).map((r) => r.decision.reason),
+    ['exceeds_session_cap', 'exceeds_session_cap', 'exceeds_session_cap'],
+  );
+});
+
+test('parallel guardedPay calls cannot exceed the rate limit', async () => {
+  const guard = new SpendGuard({ perRequestCapMinor: 100, sessionCapMinor: 1000, maxRequestsPerWindow: 2 });
+  const client = slowClient();
+  const auditLog = tmpAuditLog();
+
+  const inFlight = Array.from({ length: 4 }, () =>
+    guardedPay(client, mockChallenge({ amountMinor: 1 }), guard, auditLog));
+  client.release();
+  const results = await Promise.all(inFlight);
+
+  assert.equal(results.filter((r) => r.paid).length, 2);
+  assert.equal(results.filter((r) => r.decision.reason === 'rate_limit_exceeded').length, 2);
+});
+
+test('a failed payment releases its reservation', async () => {
+  const guard = new SpendGuard({ perRequestCapMinor: 100, sessionCapMinor: 10 });
+  const auditLog = tmpAuditLog();
+  const failing = { async pay() { throw new Error('boom'); } };
+  const working = { async pay() { return { receiptId: 'rcpt_ok' }; } };
+
+  const failed = await guardedPay(failing, mockChallenge({ amountMinor: 10 }), guard, auditLog);
+  assert.equal(failed.paid, false);
+  // The budget is free again: the same amount goes through.
+  const paid = await guardedPay(working, mockChallenge({ amountMinor: 10 }), guard, auditLog);
+  assert.equal(paid.paid, true);
+  assert.equal(guard.sessionSpentMinor, 10);
+});

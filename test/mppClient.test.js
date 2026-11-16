@@ -167,3 +167,75 @@ test('missing or NaN ceiling → onChallenge refuses to sign', async () => {
     server.close();
   }
 });
+
+// --- Hardening: recipient + currency pinned at signing time --------------------
+
+const LIVE_RECIPIENT = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+const LIVE_CURRENCY = '0x20c0000000000000000000000000000000000000';
+
+test('refuses to sign when the live challenge names a different recipient', async () => {
+  const { server, url } = await startChallengeServer(100_000);
+  try {
+    const client = createMppClient({ privateKey: generatePrivateKey() });
+    await assert.rejects(
+      () => client.pay({
+        resource: url,
+        amountMinor: 100_000,
+        recipient: '0x000000000000000000000000000000000000dEaD', // what the guard approved
+        currency: LIVE_CURRENCY,
+      }),
+      (err) => {
+        assert.match(err.message, /recipient is .* but the guard approved .* — refusing to sign/);
+        assert.equal(err.code, 'PAYMENT_FAILED');
+        return true;
+      },
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('refuses to sign when the live challenge switches currency', async () => {
+  const { server, url } = await startChallengeServer(100_000);
+  try {
+    const client = createMppClient({ privateKey: generatePrivateKey() });
+    await assert.rejects(
+      () => client.pay({
+        resource: url,
+        amountMinor: 100_000,
+        recipient: LIVE_RECIPIENT,
+        currency: '0x20c0000000000000000000000000000000000001',
+      }),
+      (err) => {
+        assert.match(err.message, /currency is .* but the guard approved .* — refusing to sign/);
+        assert.equal(err.code, 'PAYMENT_FAILED');
+        return true;
+      },
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('matching recipient and currency pass the signing-time check (any casing)', async () => {
+  const { server, url } = await startChallengeServer(100_000);
+  try {
+    const client = createMppClient({ privateKey: generatePrivateKey() });
+    // The fake server always answers 402, so pay() still fails — but at
+    // settlement, not at the recipient/currency/ceiling checks.
+    await assert.rejects(
+      () => client.pay({
+        resource: url,
+        amountMinor: 100_000,
+        recipient: LIVE_RECIPIENT.toLowerCase(),
+        currency: LIVE_CURRENCY,
+      }),
+      (err) => {
+        assert.doesNotMatch(err.message, /refusing to sign/);
+        return true;
+      },
+    );
+  } finally {
+    server.close();
+  }
+});
