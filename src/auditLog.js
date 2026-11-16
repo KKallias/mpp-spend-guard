@@ -31,6 +31,8 @@ class AuditLog {
       allowed: decision.allowed,
       reason: decision.reason,
       sessionSpentMinor: decision.sessionSpentMinor,
+      // Approved payments still in flight; they count against the session cap.
+      ...(decision.inFlightMinor ? { inFlightMinor: decision.inFlightMinor } : {}),
       ...(paymentId !== undefined ? { paymentId } : {}),
       ...(note !== undefined ? { note } : {}),
     });

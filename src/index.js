@@ -36,10 +36,15 @@ async function guardedPay(mppClient, challenge, guard, auditLog = new AuditLog()
     return { paid: false, paymentId, decision };
   }
 
+  // Reserve in the same tick as evaluate() — no await in between — so parallel
+  // guardedPay() calls see each other's in-flight amounts.
+  guard.reserve(challenge.amountMinor);
+
   let receipt;
   try {
     receipt = await mppClient.pay(challenge, payOpts);
   } catch (error) {
+    guard.release(challenge.amountMinor);
     const code = error && error.code;
     let reason;
     let note;
@@ -61,6 +66,7 @@ async function guardedPay(mppClient, challenge, guard, auditLog = new AuditLog()
     return { paid: false, paymentId, decision, error };
   }
 
+  guard.release(challenge.amountMinor);
   guard.recordSpend(challenge.amountMinor);
   return { paid: true, paymentId, receipt, decision };
 }

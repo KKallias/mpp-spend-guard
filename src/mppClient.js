@@ -26,6 +26,8 @@ const { Mppx, tempo } = require('mppx/client');
  * `onChallenge` hook, which runs *before* the credential is signed. If the
  * live challenge asks for more than the guard approved — or no valid approved
  * amount was passed at all — we throw and no payment is ever signed or sent.
+ * The same hook checks that the recipient and currency still match what the
+ * guard approved, so a server can't swap the payee or the token either.
  *
  * @param {object} [opts]
  * @param {string} [opts.privateKey]  Defaults to AGENT_WALLET_PRIVATE_KEY env var.
@@ -68,6 +70,12 @@ function createMppClient(opts = {}) {
           `MPP challenge asks for ${quoted} but the guard only approved ${ceiling} — refusing to sign`,
         );
       }
+      // The guard approved a specific payee and token, not just a number. If
+      // the live challenge names a different recipient or currency, it is a
+      // different payment — and the same amount in a token with other
+      // decimals is a different price.
+      assertSameParty('recipient', ctx.recipient, challenge.request && challenge.request.recipient);
+      assertSameParty('currency', ctx.currency, challenge.request && challenge.request.currency);
       // From here on mppx signs and sends a credential: any later failure means
       // the payment outcome is unknown.
       ctx.signed = true;
@@ -85,6 +93,9 @@ function createMppClient(opts = {}) {
      * @param {number} challenge.amountMinor  Amount the guard approved; enforced as a
      *   hard ceiling on what the live challenge is allowed to charge. Required —
      *   without it the client refuses to sign.
+     * @param {string} [challenge.recipient]  Recipient the guard approved. If given, the
+     *   live challenge must name the same one or nothing is signed.
+     * @param {string} [challenge.currency]   Token the guard approved. Same rule.
      * @param {object} [opts]
      * @param {number} [opts.timeoutMs=30000]  Abort the whole paid fetch after this long.
      * @returns {Promise<object>} Receipt-like object (status, receipt header + decoded receipt, body).
@@ -94,7 +105,12 @@ function createMppClient(opts = {}) {
      *   - 'PAYMENT_FAILED'         — any other failure (refused to sign, still 402, ...).
      */
     async pay(challenge, { timeoutMs = 30_000 } = {}) {
-      const ctx = { ceiling: challenge.amountMinor, signed: false };
+      const ctx = {
+        ceiling: challenge.amountMinor,
+        recipient: challenge.recipient,
+        currency: challenge.currency,
+        signed: false,
+      };
       const signal = AbortSignal.timeout(timeoutMs);
 
       let response;
@@ -136,6 +152,20 @@ function createMppClient(opts = {}) {
       };
     },
   };
+}
+
+/**
+ * Throws unless the live challenge names the same recipient/currency the guard
+ * approved. Skipped only when the approved challenge didn't carry the field.
+ */
+function assertSameParty(field, approved, live) {
+  if (approved === undefined || approved === null) return;
+  const same = typeof live === 'string' && String(approved).toLowerCase() === live.toLowerCase();
+  if (!same) {
+    throw new Error(
+      `MPP challenge ${field} is ${JSON.stringify(live === undefined ? 'missing' : live)} but the guard approved ${JSON.stringify(approved)} — refusing to sign`,
+    );
+  }
 }
 
 function isAbortError(err) {

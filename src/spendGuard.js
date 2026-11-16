@@ -34,6 +34,11 @@ class SpendGuard {
 
     this._sessionSpentMinor = 0;
     this._requestTimestamps = [];
+    // Approved payments that are in flight (evaluated, not yet settled). They
+    // count against the session cap and the rate limit so that parallel calls
+    // can't all pass the same check before any of them is recorded.
+    this._reservedMinor = 0;
+    this._inFlight = 0;
     // Payments whose outcome is unknown (credential may have been sent, but no
     // response came back). Keyed by payment id -> { amountMinor, resource }.
     this._pending = new Map();
@@ -45,7 +50,7 @@ class SpendGuard {
    * @param {number} challenge.amountMinor  Price of the resource, in minor units.
    * @param {string} [challenge.recipient]  Recipient wallet/account the payment would go to.
    * @param {string} [challenge.resource]   Identifier of the resource being requested (for logging).
-   * @returns {{allowed: boolean, reason: string, sessionSpentMinor: number}}
+   * @returns {{allowed: boolean, reason: string, sessionSpentMinor: number, inFlightMinor: number}}
    */
   evaluate(challenge) {
     const now = Date.now();
@@ -70,17 +75,19 @@ class SpendGuard {
       return this._deny('exceeds_per_request_cap', challenge);
     }
 
-    if (this._sessionSpentMinor + amountMinor > this.config.sessionCapMinor) {
+    if (this._sessionSpentMinor + this._reservedMinor + amountMinor > this.config.sessionCapMinor) {
       return this._deny('exceeds_session_cap', challenge);
     }
 
-    if (this.config.allowedRecipients && recipient && !this.config.allowedRecipients.includes(recipient)) {
+    // With an allowlist configured, a challenge that names no recipient is
+    // denied too — an unknown payee is not an approved payee.
+    if (this.config.allowedRecipients && !isAllowedRecipient(recipient, this.config.allowedRecipients)) {
       return this._deny('recipient_not_allowlisted', challenge);
     }
 
     // Rate limiting: drop timestamps outside the current window, then check count.
     this._requestTimestamps = this._requestTimestamps.filter((t) => now - t < this.config.windowMs);
-    if (this._requestTimestamps.length >= this.config.maxRequestsPerWindow) {
+    if (this._requestTimestamps.length + this._inFlight >= this.config.maxRequestsPerWindow) {
       return this._deny('rate_limit_exceeded', challenge);
     }
 
@@ -88,8 +95,27 @@ class SpendGuard {
       allowed: true,
       reason: 'ok',
       sessionSpentMinor: this._sessionSpentMinor,
+      inFlightMinor: this._reservedMinor,
       resource,
     };
+  }
+
+  /**
+   * Hold an approved amount while its payment is in flight. guardedPay() calls
+   * this in the same tick as evaluate(), so two parallel calls can't both spend
+   * the same remaining budget. Always pair with release().
+   */
+  reserve(amountMinor) {
+    assertValidAmount(amountMinor, 'reserve');
+    this._reservedMinor += amountMinor;
+    this._inFlight += 1;
+  }
+
+  /** Drop a reservation once the payment has settled, failed or gone unknown. */
+  release(amountMinor) {
+    assertValidAmount(amountMinor, 'release');
+    this._reservedMinor = Math.max(0, this._reservedMinor - amountMinor);
+    this._inFlight = Math.max(0, this._inFlight - 1);
   }
 
   /**
@@ -151,9 +177,19 @@ class SpendGuard {
       allowed: false,
       reason,
       sessionSpentMinor: this._sessionSpentMinor,
+      inFlightMinor: this._reservedMinor,
       resource: challenge && challenge.resource,
     };
   }
+}
+
+// Addresses are compared case-insensitively: 0xAbC… and 0xabc… are the same
+// account, and a checksum-casing difference must not turn into a bypass or a
+// false block.
+function isAllowedRecipient(recipient, allowed) {
+  if (typeof recipient !== 'string' || recipient === '') return false;
+  const wanted = recipient.toLowerCase();
+  return allowed.some((a) => typeof a === 'string' && a.toLowerCase() === wanted);
 }
 
 function assertValidAmount(amount, where) {
