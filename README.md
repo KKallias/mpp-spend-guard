@@ -1,7 +1,7 @@
 # mpp-spend-guard
 
 ![Status](https://img.shields.io/badge/status-MVP%20%2F%20testnet%20verified-brightgreen)
-![Tests](https://img.shields.io/badge/tests-20%2F20%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-28%2F28%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-%3E%3D20-blue)
 
@@ -9,11 +9,17 @@
 > MPP-protected endpoint on Tempo's Moderato testnet. Holds no real funds
 > and is not ready for production use.
 
-**A pre-payment guardrail for AI agents that spend money.** Before an agent
-signs a payment over the [Machine Payments Protocol (MPP)](https://mpp.dev),
-`mpp-spend-guard` checks it against hard limits, blocks anything out of
-policy, and writes every decision to an audit log. The check happens
-**before money moves, not after.**
+**A spending guardrail for AI agents.** Before an agent signs a payment over
+the [Machine Payments Protocol (MPP)](https://mpp.dev), `mpp-spend-guard`
+checks it against limits a human set, blocks anything outside them, and logs
+every decision. It acts **before money moves**, because afterwards is too late.
+
+See it work in under a minute, no keys or funds needed:
+
+```bash
+git clone https://github.com/KKallias/mpp-spend-guard.git && cd mpp-spend-guard
+npm ci && npm run demo
+```
 
 **Contents:** [Overview](#1-project-overview) ·
 [Safety approach](#2-safety-approach) ·
@@ -34,7 +40,7 @@ March 2026) let an AI agent pay for an API call on its own: the server answers
 agent's wallet signs a credential, and the request goes through. No human
 clicks "confirm".
 
-That's convenient, and it's risky:
+That is the point of the protocol, and also the danger:
 
 - **Payments can't be undone.** A signed on-chain payment settles. There's no
   chargeback.
@@ -45,9 +51,9 @@ That's convenient, and it's risky:
 - **Network failures are ambiguous.** If a request hangs after the credential
   is signed, the agent doesn't know whether it paid. A naive retry can pay twice.
 
-Most wallets and SDKs give agents the *ability* to pay. They don't give the
-operator a policy layer between "the agent wants to pay" and "the credential
-is signed".
+Wallets and SDKs give an agent the *ability* to pay. Nothing sits between
+"the agent wants to pay" and "the credential is signed" to ask whether it
+*should*.
 
 ### What this project does
 
@@ -60,8 +66,10 @@ enforces the operator's rules on every payment:
 | Per-request cap | Any single charge above a set maximum |
 | Session cap | Cumulative spend beyond the session budget |
 | Rate limit | Too many paid requests in a rolling window (runaway loops) |
-| Recipient allowlist (optional) | Payments to unknown recipients |
+| Recipient allowlist (optional) | Payments to unknown recipients, or to no named recipient at all |
 | Price ceiling at signing time | A live challenge that asks for more than was approved |
+| Recipient + currency pin at signing time | A live challenge that swaps the payee or the token |
+| In-flight reservation | Parallel calls that would each pass the cap alone but overspend together |
 | Strict amount validation | NaN, Infinity, fractions, strings, negatives, bigint |
 | Pending-reconciliation lock | Retrying a payment whose outcome is unknown |
 
@@ -71,9 +79,9 @@ Every decision, allowed or blocked, is appended to `audit.log` as one JSON line.
 
 ## 2. Safety approach
 
-The project's job is to stop **unauthorized** payments (outside the policy the
-human set) and to protect against **irreversible** mistakes (payments that
-can't be taken back once signed). Five design principles do that.
+Two things can go wrong when an agent pays: the payment is **unauthorized**
+(outside what the human allowed), and it is **irreversible** (it can't be
+taken back). The design answers both with five rules.
 
 ### 2.1 Decide before the irreversible step
 
@@ -87,7 +95,7 @@ flowchart TD
     B --> C{SpendGuard.evaluate}
     C -- blocked --> L1[audit.log: allowed=false + reason] --> X[No network call, nothing signed]
     C -- allowed --> D[mppx re-requests the resource]
-    D --> E{"onChallenge hook:<br/>live price ≤ approved?"}
+    D --> E{"onChallenge hook:<br/>price ≤ approved?<br/>same recipient + token?"}
     E -- no --> L2[audit.log: payment_failed] --> X
     E -- yes --> F[Credential signed, payment sent]
     F --> G{Response?}
@@ -102,10 +110,14 @@ from a *fresh* request, and the server's new challenge can quote a different
 price. Without a second check, the audit log would say "approved $0.10" while
 the wallet paid $4.
 
-[`src/mppClient.js`](src/mppClient.js) closes this gap. It enforces the
-approved amount as a **hard ceiling inside mppx's `onChallenge` hook**, which
-runs before signing. If the live price is higher than approved, or the
-approved amount is missing or invalid, it throws and nothing is signed.
+[`src/mppClient.js`](src/mppClient.js) closes this gap inside mppx's
+`onChallenge` hook, which runs before signing. Three things must still hold
+there, or it throws and nothing is signed:
+
+- the live price is **at or below** the approved amount,
+- the **recipient** is the one the guard approved,
+- the **currency** is the one the guard approved (the same number in a token
+  with different decimals is a different price).
 
 ### 2.3 Fail closed
 
@@ -115,6 +127,9 @@ When anything is unclear, the answer is "don't pay":
   check would let it through) are denied with `invalid_amount`.
 - `recordSpend()` throws on bad input, so the session total can't be corrupted.
 - No valid ceiling at signing time means no signature.
+- With an allowlist set, a challenge that names no recipient is denied.
+- Approved payments are reserved while in flight, so twenty parallel calls
+  can't each claim the same remaining budget.
 - A timeout *after* signing counts the amount as **spent**, not free.
 
 ### 2.4 Human in the loop where the machine can't know
@@ -144,8 +159,10 @@ ledger (see the real run below).
 |---|---|---|
 | Agent overspends on one call | Per-request cap | Unit test + real testnet BLOCK |
 | Runaway loop drains budget | Session cap + rate limit | Unit tests |
-| Paying an unknown party | Recipient allowlist | Unit test |
-| Server raises the price between probe and payment | Ceiling enforced in `onChallenge`, before signing | Unit test (loopback) |
+| Paying an unknown party | Recipient allowlist, denies missing recipients too | Unit tests |
+| Server raises the price between probe and payment | Ceiling enforced in `onChallenge`, before signing | Unit test (loopback) + demo |
+| Server swaps the recipient or token at payment time | Recipient and currency pinned in `onChallenge` | Unit tests (loopback) + demo |
+| Parallel calls race past the session cap or rate limit | In-flight reservation, taken in the same tick as the check | Unit tests + demo |
 | Malformed or adversarial amount slips past comparisons | Strict integer validation, fail closed | Unit tests (9 malformed inputs) |
 | Double payment after an ambiguous timeout | `outcome_unknown` + reconciliation lock | Unit tests (offline) |
 | Hanging endpoint stalls the agent | Fetch timeout (default 30 s), nothing recorded if before signing | Unit test (loopback) |
@@ -154,29 +171,62 @@ ledger (see the real run below).
 
 ## 3. Supporting evidence
 
-### 3.1 Automated tests: 20/20 passing
+### 3.1 Offline demo: one command, no keys
+
+`npm run demo` needs no keys, no internet and no funds. Scenarios 4 and 5 run
+the real `mppx` client against a local server that changes its quote between
+the probe and the payment; the others use a stand-in client that settles
+instantly. Actual output:
+
+```
+Policy: max $0.20 per call, $0.50 per session, one approved recipient
+
+1. Normal call, $0.10 to the approved recipient
+   PAID     within policy
+
+2. Agent tries a $4.00 call
+   BLOCKED  exceeds_per_request_cap
+
+3. Agent tries to pay an address that is not on the allowlist
+   BLOCKED  recipient_not_allowlisted
+
+4. Server quoted $0.10 when probed, asks $4.00 at payment time
+   BLOCKED  MPP payment failed: MPP challenge asks for 4000000 but the guard only approved 100000 — refusing to sign
+
+5. Server keeps the price but swaps the recipient at payment time
+   BLOCKED  MPP payment failed: MPP challenge recipient is "0x000000000000000000000000000000000000dEaD" but the guard approved "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" — refusing to sign
+
+6. Runaway loop: 20 calls of $0.10 fired at once
+   5 PAID, 15 BLOCKED  session spend $0.50 of $0.50 cap
+
+Audit log: 27 decisions written, 8 allowed.
+```
+
+### 3.2 Automated tests: 28/28 passing
 
 ```bash
 npm test     # node --test, loopback only, no keys or internet needed
 ```
 
 ```
-# tests 20
-# pass 20
+# tests 28
+# pass 28
 # fail 0
 ```
 
 | File | What it proves |
 |---|---|
-| [`test/spendGuard.test.js`](test/spendGuard.test.js) (13 tests) | Each cap and limit allows/blocks correctly; every decision (including blocks) reaches the audit log; 9 kinds of malformed amount are denied; bigint never reaches `pay()`; `recordSpend(NaN)` can't corrupt the total; `outcome_unknown` is counted, locks retries and reconciles both ways; other errors record no spend |
-| [`test/mppClient.test.js`](test/mppClient.test.js) (7 tests) | Against a local loopback MPP server: refuses to sign when the live price exceeds the approval; accepts at or below it; refuses to sign with a missing/NaN ceiling; a hanging endpoint yields `TIMEOUT_BEFORE_SIGNING` with nothing spent; receipts decode correctly |
+| [`test/spendGuard.test.js`](test/spendGuard.test.js) (18 tests) | Each cap and limit allows/blocks correctly; the allowlist denies missing recipients and ignores address casing; parallel calls can't overspend the session cap or the rate limit, and a failed payment frees its reservation; every decision (including blocks) reaches the audit log; 9 kinds of malformed amount are denied; bigint never reaches `pay()`; `recordSpend(NaN)` can't corrupt the total; `outcome_unknown` is counted, locks retries and reconciles both ways; other errors record no spend |
+| [`test/mppClient.test.js`](test/mppClient.test.js) (10 tests) | Against a local loopback MPP server: refuses to sign when the live price exceeds the approval, or the recipient or currency differs from it; accepts a matching challenge; refuses to sign with a missing/NaN ceiling; a hanging endpoint yields `TIMEOUT_BEFORE_SIGNING` with nothing spent; receipts decode correctly |
 
-### 3.2 Failure states (tested)
+### 3.3 Failure states (tested)
 
 | Failure | What happens | Audit `reason` |
 |---|---|---|
 | NaN / Infinity / 1.5 / `'100'` / `null` / `undefined` / negative amount | Denied before any network call; `recordSpend()` throws so the session total can't be corrupted | `invalid_amount` |
 | bigint amount (e.g. `100000n`) | Denied (safe). BigInt-native math is a TODO before mainnet | `invalid_amount` |
+| No recipient on the challenge while an allowlist is set | Denied before any network call | `recipient_not_allowlisted` |
+| Live challenge names another recipient or currency | `onChallenge` throws `… but the guard approved … — refusing to sign`; no credential created | `payment_failed` |
 | Missing / NaN / non-integer ceiling at signing | `onChallenge` throws `no valid approved amount — refusing to sign`; no credential created | `payment_failed` |
 | Endpoint hangs before a challenge is signed | `pay()` aborts after `timeoutMs` with `TIMEOUT_BEFORE_SIGNING`; no spend recorded | `timeout_before_signing` |
 | Endpoint hangs / errors *after* signing | Amount counted as spent and held pending; further payments to that resource denied until `guard.reconcile()` | `outcome_unknown`, then `pending_reconciliation` |
@@ -185,7 +235,7 @@ npm test     # node --test, loopback only, no keys or internet needed
 `{ paid: false, paymentId, decision, error }` and writes a second audit line
 with the outcome.
 
-### 3.3 Real testnet run (Tempo Moderato, Aug 2026)
+### 3.4 Real testnet run (Tempo Moderato, Aug 2026)
 
 [`scripts/run-testnet-session.js`](scripts/run-testnet-session.js) ran against
 the live MPP-protected endpoint **`https://mpp.dev/api/ping/paid`** (from
@@ -219,6 +269,10 @@ network fee). Exactly one payment settled. Decoded receipt:
 {"ts":"2026-08-06T20:29:53.389Z","resource":"https://mpp.dev/api/ping/paid","amountMinor":100000,"recipient":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","allowed":false,"reason":"exceeds_per_request_cap","sessionSpentMinor":0}
 ```
 
+This run predates v0.2. The checks added since (recipient and currency pin,
+in-flight reservation, stricter allowlist) are covered by the loopback tests
+and the demo above, and have not yet been re-run on testnet.
+
 ---
 
 ## 4. Limitations
@@ -227,43 +281,40 @@ This is an MVP. The known weaknesses, roughly from most to least important:
 
 **Scope and enforcement**
 
-- **Opt-in, not enforced by the wallet.** The guard only works if the agent's
-  code routes payments through `guardedPay()`. An agent (or injected code)
-  holding the private key directly can bypass it. Real enforcement needs the
-  key behind the guard, e.g. a signing service, smart-contract spend limits or
-  MPP session limits.
-- **Testnet only.** No real funds, no audit by a third party.
+- **The guard is opt-in.** It works only if the agent's code routes payments
+  through `guardedPay()`. Code that holds the private key can sign around it.
+  This is the main gap, and the fix is architectural: the key has to live
+  behind the guard. The path I'd take is a small signing service that owns the
+  key and runs these checks, so the agent holds no key at all, backed by MPP
+  session limits or on-chain allowances as a second cap the agent can't touch.
+- **Testnet only.** No real funds and no third-party audit.
 
 **Gaps in the checks**
 
-- **Recipient allowlist fails open when the challenge has no recipient.** The
-  check only runs if `recipient` is present. It should deny in that case.
-- **Recipient and currency are not re-checked at signing time.** The
-  `onChallenge` ceiling compares the amount only. A server could change the
-  recipient, or switch to a token with different decimals, between the probe
-  and the payment.
-- **Not safe under concurrency.** `evaluate()` and `recordSpend()` are separate
-  steps, so two parallel `guardedPay()` calls can both pass the session cap
-  before either is recorded. Needs a reservation/lock step.
-- **Rate limit counts only completed payments,** not attempts or blocked calls.
-- **No "ask a human above X" tier.** Decisions are allow or block. There's no
-  approval queue for payments that are unusual but maybe legitimate.
+- **The recipient and currency pin needs something to pin.** It applies when
+  the approved challenge carries those fields (the probe in the testnet script
+  does). A caller that passes only an amount gets only the price ceiling.
+- **Rate limit counts payments, not attempts.** In-flight and completed
+  payments count; blocked attempts don't, so the guard won't notice an agent
+  that hammers it with requests it keeps denying.
+- **No "ask a human" tier.** A payment is allowed or blocked. There is no
+  approval queue for one that is unusual but possibly legitimate.
 
 **Durability and evidence**
 
 - **State is in memory.** Session totals, rate-limit history and pending
-  reconciliations reset when the process restarts. The audit log survives,
-  but nothing reloads it.
-- **Audit log is not tamper-evident.** It's a plain append-only file, with no
-  hashing or signing.
-- **`outcome_unknown` is verified offline only** (loopback server + fake
+  reconciliations reset on restart. The audit log survives, but nothing
+  reloads it. Limits also aren't shared across processes.
+- **The audit log is not tamper-evident.** It is a plain append-only file with
+  no hashing or signing.
+- **`outcome_unknown` is verified offline only** (loopback server and a fake
   client), not against a real hanging Moderato endpoint.
-- **Amounts are JS numbers** (safe up to 2^53 − 1 minor units). BigInt-native
-  math is needed before mainnet.
+- **Amounts are JS numbers** (safe up to 2^53 − 1 minor units). BigInt math is
+  needed before mainnet.
 
-**Planned next steps:** deny on missing recipient; re-check recipient and
-currency in `onChallenge`; atomic reserve/commit for concurrent calls;
-persistent state; a hash-chained audit log; an optional human-approval tier.
+**Next steps, in order:** signing service that holds the key; persistent and
+shared state; a hash-chained audit log; a human-approval tier; a fresh testnet
+run covering the v0.2 checks.
 
 ---
 
@@ -273,7 +324,8 @@ persistent state; a hash-chained audit log; an optional human-approval tier.
 git clone https://github.com/KKallias/mpp-spend-guard.git
 cd mpp-spend-guard
 npm ci
-npm test                      # 20/20, loopback only, no keys needed
+npm run demo                  # one payment allowed, five attacks blocked, offline
+npm test                      # 28/28, loopback only, no keys needed
 cp .env.example .env          # fill in a THROWAWAY, faucet-funded testnet key
 node --env-file=.env scripts/run-testnet-session.js
 cat audit.log                 # one allowed + paid, one blocked
@@ -313,6 +365,7 @@ const guard = new SpendGuard({
   allowedRecipients: ['0x...'],    // optional
 });
 
+// challenge = { resource, amountMinor, recipient, currency }, read from the 402
 const { paid, receipt, decision } = await guardedPay(mppClient, challenge, guard);
 if (!paid) console.log('Blocked:', decision.reason);
 ```
@@ -321,12 +374,13 @@ if (!paid) console.log('Blocked:', decision.reason);
 
 | Path | Purpose |
 |---|---|
-| [`src/spendGuard.js`](src/spendGuard.js) | Decision engine: caps, rate limit, allowlist, validation, reconciliation |
-| [`src/index.js`](src/index.js) | `guardedPay()`: evaluate → log → pay → record / handle failure |
-| [`src/mppClient.js`](src/mppClient.js) | `mppx` wrapper: signing-time price ceiling, timeout, receipt decoding |
+| [`src/spendGuard.js`](src/spendGuard.js) | Decision engine: caps, rate limit, allowlist, validation, reservations, reconciliation |
+| [`src/index.js`](src/index.js) | `guardedPay()`: evaluate → log → reserve → pay → record / handle failure |
+| [`src/mppClient.js`](src/mppClient.js) | `mppx` wrapper: signing-time price, recipient and currency checks, timeout, receipt decoding |
 | [`src/auditLog.js`](src/auditLog.js) | Append-only JSONL audit log |
+| [`scripts/demo.js`](scripts/demo.js) | Offline demo: one normal payment, five blocked attacks, no keys |
 | [`scripts/run-testnet-session.js`](scripts/run-testnet-session.js) | Live ALLOW + BLOCK run on Moderato |
-| [`test/`](test) | 20 unit tests, loopback only |
+| [`test/`](test) | 28 unit tests, loopback only |
 
 ### Related
 
